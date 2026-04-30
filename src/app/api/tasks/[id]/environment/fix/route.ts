@@ -1,5 +1,4 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { exec, type ExecException } from 'child_process';
 import { NextRequest, NextResponse } from 'next/server';
 import { queryAll, queryOne, run } from '@/lib/db';
 import { broadcast } from '@/lib/events';
@@ -11,15 +10,18 @@ import {
 import {
   classifyEnvironmentIssueFromTexts,
   hasEnvironmentIssueCommand,
+  type EnvironmentIssue,
   type EnvironmentIssueCode,
 } from '@/lib/environment-issues';
 import type { Task } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 
-const execAsync = promisify(exec);
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+const RUNNING_STALE_MS = COMMAND_TIMEOUT_MS + 60 * 1000;
 const MAX_OUTPUT_CHARS = 6000;
+
+const runningEnvironmentFixes = new Map<string, { command: string; startedAt: string }>();
 
 interface RecentActivity {
   created_at?: string;
@@ -28,40 +30,40 @@ interface RecentActivity {
   metadata?: string | null;
 }
 
+interface EnvironmentFixActivity {
+  created_at: string;
+  activity_type: string;
+  message: string;
+  metadata?: string | null;
+}
+
+interface EnvironmentFixRun {
+  task: Task;
+  issue: EnvironmentIssue;
+  suggestion: EnvironmentCommandSuggestion | null;
+  command: string;
+  commandSource: string;
+  retry: boolean;
+}
+
 function compactOutput(value: string | Buffer | undefined): string {
   const text = Buffer.isBuffer(value) ? value.toString('utf8') : value || '';
   return text.length > MAX_OUTPUT_CHARS ? text.slice(-MAX_OUTPUT_CHARS) : text;
 }
 
-async function runCommand(command: string, cwd?: string) {
-  try {
-    const result = await execAsync(command, {
-      cwd,
-      timeout: COMMAND_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024 * 8,
-      env: process.env,
-    });
-
-    return {
-      stdout: compactOutput(result.stdout),
-      stderr: compactOutput(result.stderr),
-    };
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException & { stdout?: string | Buffer; stderr?: string | Buffer };
-    const stderr = compactOutput(err.stderr);
-    const stdout = compactOutput(err.stdout);
-    const detail = [stderr, stdout, err.message].filter(Boolean).join('\n').trim();
-    throw new Error(detail || `Command failed: ${command}`);
-  }
-}
-
-async function runEnvironmentFix(task: Task, approvedCommand: string) {
-  const result = await runCommand(approvedCommand, task.workspace_path || undefined);
-  return {
-    command: approvedCommand,
-    stdout: result.stdout,
-    stderr: result.stderr,
-  };
+function formatCommandFailure(
+  command: string,
+  error: ExecException,
+  stdout: string | Buffer | undefined,
+  stderr: string | Buffer | undefined
+): string {
+  const stderrText = compactOutput(stderr);
+  const stdoutText = compactOutput(stdout);
+  const timeoutText = error.killed
+    ? `Command did not finish before the ${Math.round(COMMAND_TIMEOUT_MS / 1000)}s timeout and was stopped.`
+    : '';
+  const detail = [stderrText, stdoutText, timeoutText, error.message].filter(Boolean).join('\n').trim();
+  return detail || `Command failed: ${command}`;
 }
 
 function collectIssueText(task: Task, activities: RecentActivity[], requestText?: string): Array<string | null | undefined> {
@@ -79,6 +81,162 @@ function recordActivity(taskId: string, agentId: string | null, type: string, me
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [crypto.randomUUID(), taskId, agentId, type, message, metadata ? JSON.stringify(metadata) : null, new Date().toISOString()]
   );
+}
+
+function getRunningEnvironmentFix(taskId: string): { command: string; startedAt: string } | null {
+  const inMemory = runningEnvironmentFixes.get(taskId);
+  if (inMemory) return inMemory;
+
+  const latest = queryOne<EnvironmentFixActivity>(
+    `SELECT created_at, activity_type, message, metadata
+     FROM task_activities
+     WHERE task_id = ?
+       AND activity_type IN ('environment_fix_started', 'environment_fix_failed', 'environment_fix_completed', 'environment_fix_retry_failed')
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [taskId]
+  );
+
+  if (!latest || latest.activity_type !== 'environment_fix_started') return null;
+
+  const startedAtMs = new Date(latest.created_at).getTime();
+  if (!Number.isFinite(startedAtMs) || Date.now() - startedAtMs > RUNNING_STALE_MS) return null;
+
+  let command = latest.message.replace(/^Running approved environment command:\s*/i, '').trim();
+  try {
+    const metadata = latest.metadata ? JSON.parse(latest.metadata) as { command?: string } : null;
+    if (metadata?.command) command = metadata.command;
+  } catch {
+    // Ignore malformed historical metadata; the activity message still carries the command.
+  }
+
+  return { command, startedAt: latest.created_at };
+}
+
+function updateTaskState(taskId: string, statusReason: string, planningError?: string | null): Task | null {
+  if (planningError === undefined) {
+    run(
+      `UPDATE tasks
+       SET status_reason = ?,
+           updated_at = ?
+       WHERE id = ?`,
+      [statusReason, new Date().toISOString(), taskId]
+    );
+  } else {
+    run(
+      `UPDATE tasks
+       SET planning_dispatch_error = ?,
+           status_reason = ?,
+           updated_at = ?
+       WHERE id = ?`,
+      [planningError, statusReason, new Date().toISOString(), taskId]
+    );
+  }
+
+  const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
+  if (updatedTask) broadcast({ type: 'task_updated', payload: updatedTask });
+  return updatedTask ?? null;
+}
+
+async function finishEnvironmentFix(
+  runConfig: EnvironmentFixRun,
+  error: ExecException | null,
+  stdout: string | Buffer | undefined,
+  stderr: string | Buffer | undefined
+) {
+  const { task, issue, suggestion, command, retry } = runConfig;
+  runningEnvironmentFixes.delete(task.id);
+
+  if (error) {
+    const message = formatCommandFailure(command, error, stdout, stderr);
+    updateTaskState(
+      task.id,
+      `Environment fix failed: ${issue.title}`,
+      `Environment fix failed (${issue.code}): ${message}`
+    );
+
+    recordActivity(task.id, task.assigned_agent_id, 'environment_fix_failed', `Environment fix failed: ${issue.title}`, {
+      issue,
+      suggestion,
+      command,
+      error: message,
+    });
+    return;
+  }
+
+  const stdoutText = compactOutput(stdout);
+  const stderrText = compactOutput(stderr);
+  recordActivity(task.id, task.assigned_agent_id, 'environment_fix_completed', `Environment fix completed: ${issue.title}`, {
+    issue,
+    suggestion,
+    command,
+    stdout: stdoutText,
+    stderr: stderrText,
+  });
+
+  updateTaskState(
+    task.id,
+    retry
+      ? `Environment fix completed: ${issue.title}. Retrying assigned agent.`
+      : `Environment fix completed: ${issue.title}.`,
+    null
+  );
+
+  if (!retry) return;
+
+  const retryResult = await dispatchTaskFromServer(task.id);
+  if (!retryResult.success) {
+    updateTaskState(
+      task.id,
+      `Environment fix completed: ${issue.title}, but retry failed.`,
+      retryResult.error || 'Environment fixed, but retry failed.'
+    );
+    recordActivity(task.id, task.assigned_agent_id, 'environment_fix_retry_failed', `Environment fix retry failed: ${issue.title}`, {
+      issue,
+      suggestion,
+      command,
+      error: retryResult.error || 'Environment fixed, but retry failed.',
+    });
+    return;
+  }
+
+  const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [task.id]);
+  if (updatedTask) broadcast({ type: 'task_updated', payload: updatedTask });
+}
+
+function startEnvironmentFix(runConfig: EnvironmentFixRun): { command: string; startedAt: string } {
+  const startedAt = new Date().toISOString();
+  const { task, issue, suggestion, command, commandSource } = runConfig;
+  runningEnvironmentFixes.set(task.id, { command, startedAt });
+
+  recordActivity(task.id, task.assigned_agent_id, 'environment_fix_started', `Running approved environment command: ${command}`, {
+    issue,
+    suggestion,
+    command,
+    commandSource,
+    timeoutMs: COMMAND_TIMEOUT_MS,
+  });
+
+  updateTaskState(task.id, `Environment fix running: ${issue.title}`);
+
+  exec(
+    command,
+    {
+      cwd: task.workspace_path || undefined,
+      timeout: COMMAND_TIMEOUT_MS,
+      killSignal: 'SIGTERM',
+      maxBuffer: 1024 * 1024 * 8,
+      env: process.env,
+    },
+    (error, stdout, stderr) => {
+      void finishEnvironmentFix(runConfig, error, stdout, stderr).catch((finishError) => {
+        runningEnvironmentFixes.delete(task.id);
+        console.error('[Environment Fix] Failed to finish background command:', finishError);
+      });
+    }
+  );
+
+  return { command, startedAt };
 }
 
 export async function POST(
@@ -130,6 +288,24 @@ export async function POST(
       }, { status: 409 });
     }
 
+    const runningFix = getRunningEnvironmentFix(taskId);
+    if (runningFix) {
+      const runningTask = task.status_reason?.toLowerCase().startsWith('environment fix running:')
+        ? task
+        : updateTaskState(taskId, `Environment fix running: ${issue.title}`);
+
+      return NextResponse.json({
+        success: true,
+        running: true,
+        fixed: false,
+        retried: false,
+        issue,
+        suggestion: null,
+        fix: { command: runningFix.command, startedAt: runningFix.startedAt },
+        task: runningTask,
+      }, { status: 202 });
+    }
+
     const approvedCommand = body.approvedCommand?.trim();
     let commandToRun = approvedCommand;
     let commandSource = hasEnvironmentIssueCommand(issue) ? issue.action.commandSource || 'detected' : 'user_input';
@@ -179,94 +355,27 @@ export async function POST(
       }, { status: 409 });
     }
 
-    recordActivity(taskId, task.assigned_agent_id, 'environment_fix_started', `Running approved environment command: ${commandToRun}`, {
+    const fixRun = startEnvironmentFix({
+      task,
       issue,
       suggestion,
+      command: commandToRun,
       commandSource,
+      retry: body.retry !== false,
     });
-
-    let fixResult: Awaited<ReturnType<typeof runEnvironmentFix>>;
-    try {
-      fixResult = await runEnvironmentFix(task, commandToRun);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Environment fix failed';
-      run(
-        `UPDATE tasks
-         SET planning_dispatch_error = ?,
-             status_reason = ?,
-             updated_at = ?
-         WHERE id = ?`,
-        [`Environment fix failed (${issue.code}): ${message}`, `Environment fix failed: ${issue.title}`, new Date().toISOString(), taskId]
-      );
-      recordActivity(taskId, task.assigned_agent_id, 'environment_fix_failed', `Environment fix failed: ${issue.title}`, {
-        issue,
-        suggestion,
-        error: message,
-      });
-
-      const failedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
-      if (failedTask) broadcast({ type: 'task_updated', payload: failedTask });
-
-      return NextResponse.json({
-        success: false,
-        fixed: false,
-        issue,
-        suggestion,
-        error: message,
-        task: failedTask,
-      }, { status: 500 });
-    }
-
-    recordActivity(taskId, task.assigned_agent_id, 'environment_fix_completed', `Environment fix completed: ${issue.title}`, {
-      issue,
-      suggestion,
-      command: fixResult.command,
-      stdout: fixResult.stdout,
-      stderr: fixResult.stderr,
-    });
-
-    run(
-      `UPDATE tasks
-       SET planning_dispatch_error = NULL,
-           status_reason = ?,
-           updated_at = ?
-       WHERE id = ?`,
-      [`Environment fix completed: ${issue.title}. Retrying assigned agent.`, new Date().toISOString(), taskId]
-    );
-
-    let retryResult: Awaited<ReturnType<typeof dispatchTaskFromServer>> | null = null;
-    if (body.retry !== false) {
-      retryResult = await dispatchTaskFromServer(taskId);
-    }
-
     const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
-    if (updatedTask) {
-      broadcast({ type: 'task_updated', payload: updatedTask });
-    }
-
-    if (retryResult && !retryResult.success) {
-      return NextResponse.json({
-        success: false,
-        fixed: true,
-        retried: false,
-        issue,
-        suggestion,
-        fix: fixResult,
-        error: retryResult.error || 'Environment fixed, but retry failed.',
-        task: updatedTask,
-      }, { status: retryResult.status || 502 });
-    }
 
     return NextResponse.json({
       success: true,
-      fixed: true,
-      retried: body.retry !== false,
+      running: true,
+      started: true,
+      fixed: false,
+      retried: false,
       issue,
       suggestion,
-      fix: fixResult,
-      retry: retryResult,
+      fix: fixRun,
       task: updatedTask,
-    });
+    }, { status: 202 });
   } catch (error) {
     console.error('[Environment Fix] Failed:', error);
     return NextResponse.json({

@@ -18,9 +18,11 @@ interface TaskActionResponse {
   userMessage?: string;
   task?: Task;
   issue?: EnvironmentIssue;
+  running?: boolean;
+  started?: boolean;
   fixed?: boolean;
   retried?: boolean;
-  fix?: { command?: string };
+  fix?: { command?: string; startedAt?: string };
   suggestion?: { command?: string; rationale?: string };
 }
 
@@ -44,6 +46,10 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
   const [userCommand, setUserCommand] = useState('');
 
   if (!issue) return null;
+
+  const fixStartedAt = task.updated_at ? new Date(task.updated_at).getTime() : NaN;
+  const fixIsFresh = Number.isFinite(fixStartedAt) && Date.now() - fixStartedAt < 11 * 60 * 1000;
+  const fixIsRunning = (task.status_reason?.toLowerCase().startsWith('environment fix running:') ?? false) && fixIsFresh;
 
   const stop = (event: MouseEvent) => {
     event.stopPropagation();
@@ -72,6 +78,10 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
 
   const handleRetry = async (event: MouseEvent) => {
     stop(event);
+    if (fixIsRunning) {
+      setMessage('Environment fix is still running. The agent will retry automatically if it succeeds.');
+      return;
+    }
     setIsRetrying(true);
     setError(null);
     setMessage(null);
@@ -96,6 +106,10 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
 
   const handleRunFix = async (event: MouseEvent) => {
     stop(event);
+    if (fixIsRunning) {
+      setMessage('Environment fix is already running.');
+      return;
+    }
     if (!approvedCommand) {
       setError('Enter a command first.');
       return;
@@ -125,7 +139,12 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
         return;
       }
 
-      setMessage(data.retried ? 'Fix ran and agent retry started.' : 'Fix ran successfully.');
+      if (data.running) {
+        const command = data.fix?.command ? ` Running: ${data.fix.command}` : '';
+        setMessage(`Environment fix started.${command} The agent will retry automatically if it succeeds.`);
+      } else {
+        setMessage(data.retried ? 'Fix ran and agent retry started.' : 'Fix ran successfully.');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Environment fix failed.');
     } finally {
@@ -135,6 +154,10 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
 
   const handleAutoFix = async (event: MouseEvent) => {
     stop(event);
+    if (fixIsRunning) {
+      setMessage('Environment fix is already running.');
+      return;
+    }
     setIsFixing(true);
     setIsConfirmingCommand(false);
     setIsEnteringCommand(false);
@@ -164,7 +187,12 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
       }
 
       const ran = data.fix?.command ? ` Ran: ${data.fix.command}` : '';
-      setMessage(data.retried ? `Fix ran and agent retry started.${ran}` : `Fix ran successfully.${ran}`);
+      if (data.running) {
+        const command = data.fix?.command ? ` Running: ${data.fix.command}` : '';
+        setMessage(`Environment fix started.${command} The agent will retry automatically if it succeeds.`);
+      } else {
+        setMessage(data.retried ? `Fix ran and agent retry started.${ran}` : `Fix ran successfully.${ran}`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Auto fix failed.');
     } finally {
@@ -191,7 +219,9 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
 
       {!compact && (
         <div className="mt-2 text-xs opacity-80">
-          {issue.userMessage}
+          {fixIsRunning
+            ? 'Mission Control is running the approved setup command. The assigned agent will retry automatically if it succeeds.'
+            : issue.userMessage}
         </div>
       )}
 
@@ -212,11 +242,11 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
               setError(null);
               setMessage(null);
             }}
-            disabled={isFixing || isRetrying}
+            disabled={isFixing || isRetrying || fixIsRunning}
             className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded border border-white/20 bg-white/10 px-2.5 text-[11px] font-medium hover:bg-white/20 disabled:opacity-50"
           >
-            <Wrench className="w-3.5 h-3.5" />
-            {isFixing ? 'Running command...' : issue.action.label}
+            <Wrench className={`w-3.5 h-3.5 ${fixIsRunning || isFixing ? 'animate-spin' : ''}`} />
+            {fixIsRunning ? 'Fix running...' : isFixing ? 'Running command...' : issue.action.label}
           </button>
         )}
 
@@ -224,11 +254,11 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
           <button
             type="button"
             onClick={handleAutoFix}
-            disabled={isFixing || isRetrying}
+            disabled={isFixing || isRetrying || fixIsRunning}
             className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded border border-white/20 bg-white/10 px-2.5 text-[11px] font-medium hover:bg-white/20 disabled:opacity-50"
           >
-            <Wrench className="w-3.5 h-3.5" />
-            {isFixing ? 'Auto fixing...' : 'Auto fix & retry'}
+            <Wrench className={`w-3.5 h-3.5 ${fixIsRunning || isFixing ? 'animate-spin' : ''}`} />
+            {fixIsRunning ? 'Fix running...' : isFixing ? 'Auto fixing...' : 'Auto fix & retry'}
           </button>
         )}
 
@@ -242,7 +272,7 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
               setError(null);
               setMessage(null);
             }}
-            disabled={isFixing || isRetrying}
+            disabled={isFixing || isRetrying || fixIsRunning}
             className="inline-flex min-h-9 items-center justify-center rounded border border-white/15 px-2.5 text-[11px] hover:bg-white/10 disabled:opacity-50"
           >
             Enter command
@@ -274,7 +304,7 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
         <button
           type="button"
           onClick={handleRetry}
-          disabled={isFixing || isRetrying}
+          disabled={isFixing || isRetrying || fixIsRunning}
           className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded border border-white/15 px-2.5 text-[11px] hover:bg-white/10 disabled:opacity-50"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${isRetrying ? 'animate-spin' : ''}`} />
@@ -317,7 +347,7 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
                 setIsEnteringCommand(false);
                 setIsConfirmingCommand(true);
               }}
-              disabled={isFixing || isRetrying}
+              disabled={isFixing || isRetrying || fixIsRunning}
               className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded bg-white/15 px-2.5 text-[11px] font-medium hover:bg-white/20 disabled:opacity-50"
             >
               <Wrench className="w-3.5 h-3.5" />
@@ -356,7 +386,7 @@ export function EnvironmentIssuePanel({ task, compact = false, className = '' }:
             <button
               type="button"
               onClick={handleRunFix}
-              disabled={isFixing || isRetrying}
+              disabled={isFixing || isRetrying || fixIsRunning}
               className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded bg-white/15 px-2.5 text-[11px] font-medium hover:bg-white/20 disabled:opacity-50"
             >
               <Wrench className="w-3.5 h-3.5" />
